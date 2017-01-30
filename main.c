@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <stdlib.h>
 #include <string.h>
 
 #include "ch.h"
@@ -37,6 +38,7 @@ struct Ws2812bCtx {
     uint16_t pin;
     uint16_t MASK;
     uint16_t ctl[WS2812B_NUMBER * 24];
+    uint8_t demo;
 } ledCtx;
 
 static void pwmc1cb(PWMDriver *pwmp) {
@@ -46,7 +48,7 @@ static void pwmc1cb(PWMDriver *pwmp) {
 /*
  * WS2812B thread, times are in milliseconds.
  */
-static THD_WORKING_AREA(waWs2812b, 256);
+static THD_WORKING_AREA(waWs2812b, 128);
 static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
   (void)arg;
   // Configure pwm timers:
@@ -181,6 +183,59 @@ static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
 }
 
 /*===========================================================================*/
+/* DemoCtrl thread related.                                                  */
+/*===========================================================================*/
+
+#define MAX_BRIGHTNESS                    15
+
+// http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.43.3639
+/* Generates numbers between 0 and 1. */
+static float lfsr113(void) {
+    static uint32_t z1 = 127, z2 = 127, z3 = 127, z4 = 127;
+    uint32_t b;
+
+    b = (((z1 << 6) ^ z1) >> 13);
+    z1 = (((z1 & 4294967294U) << 18) ^ b);
+    b = (((z2 << 2) ^ z2) >> 27);
+    z2 = (((z2 & 4294967288U) << 2) ^ b);
+    b = (((z3 << 13) ^ z3) >> 21);
+    z3 = (((z3 & 4294967280U) << 7) ^ b);
+    b = (((z4 << 3) ^ z4) >> 12);
+    z4 = (((z4 & 4294967168U) << 13) ^ b);
+
+    return ((z1 ^ z2 ^ z3 ^ z4) * 2.3283064365387e-10);
+}
+
+/*
+ * Demo thread, times are in milliseconds.
+ */
+static THD_WORKING_AREA(waDemoCtrl, 96);
+static __attribute__((noreturn)) THD_FUNCTION(DemoCtrl, arg) {
+  (void)arg;
+
+  chRegSetThreadName("DemoCtrl");
+
+  while (TRUE) {
+    chThdSleepMilliseconds(50);
+
+    if (ledCtx.demo) {
+      uint32_t idx, r, g, b;
+
+      chMtxLock(&ledCtx.mtx);
+      for (idx = 0; idx < WS2812B_NUMBER; idx++) {
+        r = lfsr113() * MAX_BRIGHTNESS;
+        g = lfsr113() * MAX_BRIGHTNESS;
+        b = lfsr113() * MAX_BRIGHTNESS;
+        ledCtx.fb[idx] = g << 16 | r << 8 | b;
+      }
+      chMtxUnlock(&ledCtx.mtx);
+
+      chEvtBroadcastFlags(&upd_event, EVENT_WS2812B_UPDATE);
+    }
+  }
+}
+
+/*===========================================================================*/
 /* Command line related.                                                     */
 /*===========================================================================*/
 
@@ -210,6 +265,9 @@ static void cmd_led(BaseSequentialStream *chp, int argc, char *argv[]) {
   r = hexToInt(argv[0]);
   g = hexToInt(argv[1]);
   b = hexToInt(argv[2]);
+
+  /* Disable WS2812B demo controller */
+  ledCtx.demo = 0;
 
   chMtxLock(&ledCtx.mtx);
   for (idx = 0; idx < WS2812B_NUMBER; idx++) {
@@ -266,10 +324,17 @@ int __attribute__((noreturn)) main(void)
 
   ledCtx.port = WS2812B_PORT;
   ledCtx.pin = WS2812B_PIN;
+  ledCtx.demo = 1;
+
   /*
    * Creates the WS2812B thread.
    */
   chThdCreateStatic(waWs2812b, sizeof(waWs2812b), NORMALPRIO, Ws2812b, NULL);
+
+  /*
+   * Creates the DemoCtrl thread.
+   */
+  chThdCreateStatic(waDemoCtrl, sizeof(waDemoCtrl), NORMALPRIO, DemoCtrl, NULL);
 
   while(TRUE){
     thread_t *shelltp = chThdCreateFromHeap(NULL, SHELL_WA_SIZE,

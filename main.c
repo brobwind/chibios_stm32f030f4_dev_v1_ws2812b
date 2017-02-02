@@ -47,14 +47,15 @@ static void pwmc1cb(PWMDriver *pwmp) {
 
 /*
  * WS2812B thread, times are in milliseconds.
+ * Steal from: https://github.com/omriiluz/WS2812B-LED-Driver-ChibiOS
  */
-static THD_WORKING_AREA(waWs2812b, 128);
+static THD_WORKING_AREA(waWs2812b, 256);
 static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
   (void)arg;
   // Configure pwm timers:
-  // - timer 1 as master, active for data transmission and inactive to disable transmission during reset period (50ms)
-  // - timer 3 as slave, during active time creates a 1.25 us signal, with duty cycle controlled by frame buffer values
-  const PWMConfig pwmc1 = {
+  // - timer 3 as master, active for data transmission and inactive to disable transmission during reset period (50ms)
+  // - timer 1 as slave, during active time creates a 1.25 us signal, with duty cycle controlled by frame buffer values
+  const PWMConfig pwmd3cfg = {
     48000000 / 60, /* 800Khz PWM clock frequency. 1/60 of PWMC3 */
     (48000000 / 60) * 0.05, /* Total period is 50ms (20FPS), including leds cycles + reset length for ws2812b and FB writes */
     NULL,
@@ -67,15 +68,14 @@ static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
     TIM_CR2_MMS_2, /* master mode selection */
     0,
   };
-  /* master mode selection */
-  const PWMConfig pwmc3 = {
+  const PWMConfig pwmd1cfg = {
     48000000, /* 48Mhz PWM clock frequency. */
     60, /* 60 cycles period (0.25 us per period @48Mhz */
     NULL,
     {
       { PWM_OUTPUT_ACTIVE_HIGH, NULL },
-      { PWM_OUTPUT_DISABLED, NULL },
       { PWM_OUTPUT_ACTIVE_HIGH, NULL },
+      { PWM_OUTPUT_DISABLED, NULL },
       { PWM_OUTPUT_DISABLED, NULL }
     },
     0,
@@ -100,64 +100,61 @@ static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
   /* Send reset code: should > 50us */
   chThdSleepMilliseconds(1);
 
-  // DMA stream 2, triggered by channel3 pwm signal. if FB indicates, reset output value early to indicate "0" bit to ws2812
+  // DMA stream 2, triggered by TIM1_CH1 pwm signal. if FB indicates, reset output value early to indicate "0" bit to ws2812
   dmaStreamAllocate(STM32_DMA1_STREAM2, 10, NULL, NULL);
   dmaStreamSetPeripheral(STM32_DMA1_STREAM2, &(ledCtx.port->BSRR.H.clear));
   dmaStreamSetMemory0(STM32_DMA1_STREAM2, ledCtx.ctl);
   dmaStreamSetTransactionSize(STM32_DMA1_STREAM2, sizeof(ledCtx.ctl) / sizeof(ledCtx.ctl[0]));
-  dmaStreamSetMode(
-      STM32_DMA1_STREAM2,
+  dmaStreamSetMode(STM32_DMA1_STREAM2,
       STM32_DMA_CR_DIR_M2P | STM32_DMA_CR_MINC | STM32_DMA_CR_PSIZE_HWORD |
-      STM32_DMA_CR_MSIZE_HWORD | STM32_DMA_CR_CIRC | STM32_DMA_CR_PL(2));
+      STM32_DMA_CR_MSIZE_HWORD | STM32_DMA_CR_CIRC);
 
-  // DMA stream 3, triggered by pwm update event. output high at beginning of signal
+  // DMA stream 5, triggered by TIM1_UP event. output high at beginning of signal
+  dmaStreamAllocate(STM32_DMA1_STREAM5, 10, NULL, NULL);
+  dmaStreamSetPeripheral(STM32_DMA1_STREAM5, &(ledCtx.port->BSRR.H.set));
+  dmaStreamSetMemory0(STM32_DMA1_STREAM5, &ledCtx.MASK);
+  dmaStreamSetTransactionSize(STM32_DMA1_STREAM5, 1);
+  dmaStreamSetMode(STM32_DMA1_STREAM5, STM32_DMA_CR_TEIE |
+      STM32_DMA_CR_DIR_M2P | STM32_DMA_CR_PSIZE_HWORD |
+      STM32_DMA_CR_MSIZE_HWORD | STM32_DMA_CR_CIRC);
+
+  // DMA stream 3, triggered by TIM1_CH2 event. reset output value late to indicate "1" bit to ws2812.
+  // always triggers but no affect if dma stream 2 already change output value to 0
   dmaStreamAllocate(STM32_DMA1_STREAM3, 10, NULL, NULL);
-  dmaStreamSetPeripheral(STM32_DMA1_STREAM3, &(ledCtx.port->BSRR.H.set));
+  dmaStreamSetPeripheral(STM32_DMA1_STREAM3, &(ledCtx.port->BSRR.H.clear));
   dmaStreamSetMemory0(STM32_DMA1_STREAM3, &ledCtx.MASK);
   dmaStreamSetTransactionSize(STM32_DMA1_STREAM3, 1);
-  dmaStreamSetMode(
-      STM32_DMA1_STREAM3, STM32_DMA_CR_TEIE |
+  dmaStreamSetMode(STM32_DMA1_STREAM3,
       STM32_DMA_CR_DIR_M2P | STM32_DMA_CR_PSIZE_HWORD |
-      STM32_DMA_CR_MSIZE_HWORD | STM32_DMA_CR_CIRC | STM32_DMA_CR_PL(3));
+      STM32_DMA_CR_MSIZE_HWORD | STM32_DMA_CR_CIRC);
 
-  // DMA stream 4, triggered by channel1 update event. reset output value late to indicate "1" bit to ws2812.
-  // always triggers but no affect if dma stream 2 already change output value to 0
-  dmaStreamAllocate(STM32_DMA1_STREAM4, 10, NULL, NULL);
-  dmaStreamSetPeripheral(STM32_DMA1_STREAM4, &(ledCtx.port->BSRR.H.clear));
-  dmaStreamSetMemory0(STM32_DMA1_STREAM4, &ledCtx.MASK);
-  dmaStreamSetTransactionSize(STM32_DMA1_STREAM4, 1);
-  dmaStreamSetMode(
-      STM32_DMA1_STREAM4,
-      STM32_DMA_CR_DIR_M2P | STM32_DMA_CR_PSIZE_HWORD |
-      STM32_DMA_CR_MSIZE_HWORD | STM32_DMA_CR_CIRC | STM32_DMA_CR_PL(3));
-
-  pwmStart(&PWMD1, &pwmc1);
-  pwmStart(&PWMD3, &pwmc3);
-  // set pwm3 as slave, triggerd by pwm1 oc1 event. disables pwmd1 for synchronization.
-  PWMD3.tim->SMCR |= TIM_SMCR_SMS_0 | TIM_SMCR_SMS_2; // ITR0(TS=000)
-  PWMD1.tim->CR1 &= ~TIM_CR1_CEN;
+  pwmStart(&PWMD3, &pwmd3cfg);
+  pwmStart(&PWMD1, &pwmd1cfg);
+  // set pwm1 as slave, triggerd by pwm3 oc1 event. disables pwmd3 for synchronization.
+  PWMD1.tim->SMCR |= TIM_SMCR_SMS_0 | TIM_SMCR_SMS_2 | TIM_SMCR_TS_1; // ITR2(TS=010) TIM3
+  PWMD3.tim->CR1 &= ~TIM_CR1_CEN;
 
   // set pwm values.
   // 17 (duty in ticks) / 60 (period in ticks) * 1.25us (period in S) = 0.354 us
-  pwmEnableChannel(&PWMD3, 2, 17);
+  pwmEnableChannel(&PWMD1, 0, 17);
   // 43 (duty in ticks) / 60 (period in ticks) * 1.25us (period in S) = 0.896 us
-  pwmEnableChannel(&PWMD3, 0, 43);
+  pwmEnableChannel(&PWMD1, 1, 43);
 
   // active during transfer of leds * 24 bytes
-  pwmEnableChannel(&PWMD1, 0, WS2812B_NUMBER * 24);
+  pwmEnableChannel(&PWMD3, 0, WS2812B_NUMBER * 24);
 
-  pwmEnableChannelNotification(&PWMD1, 2);
-  pwmEnableChannel(&PWMD1, 2, (WS2812B_NUMBER + 2) * 24);
+  pwmEnableChannelNotification(&PWMD3, 2);
+  pwmEnableChannel(&PWMD3, 2, (WS2812B_NUMBER + 2) * 24);
 
   // stop and reset counters for synchronization
-  PWMD1.tim->CNT = 0;
-  // Slave (TIM3) needs to "update" immediately after master (TIM1) start in order to start in sync.
+  PWMD3.tim->CNT = 0;
+  // Slave (TIM1) needs to "update" immediately after master (TIM3) start in order to start in sync.
   // this initial sync is crucial for the stability of the run
-  PWMD3.tim->CNT = 59;
-  PWMD3.tim->DIER |= TIM_DIER_CC3DE | TIM_DIER_CC1DE | TIM_DIER_UDE;
-  dmaStreamEnable(STM32_DMA1_STREAM3);
-  dmaStreamEnable(STM32_DMA1_STREAM4);
+  PWMD1.tim->CNT = 59;
+  PWMD1.tim->DIER |= TIM_DIER_CC1DE | TIM_DIER_CC2DE | TIM_DIER_UDE;
   dmaStreamEnable(STM32_DMA1_STREAM2);
+  dmaStreamEnable(STM32_DMA1_STREAM5);
+  dmaStreamEnable(STM32_DMA1_STREAM3);
 
   while (TRUE) {
     uint32_t idx;
@@ -174,9 +171,9 @@ static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
 
     // all systems go! both timers and all channels are configured to resonate
     // in complete sync without any need for CPU cycles (only DMA and timers)
-    // start pwm1 for system to start resonating
-    PWMD1.tim->CR1 |= TIM_CR1_CEN;
-    while (PWMD1.tim->CR1 & TIM_CR1_CEN) {}
+    // start pwm3 for system to start resonating
+    PWMD3.tim->CR1 |= TIM_CR1_CEN;
+    while (PWMD3.tim->CR1 & TIM_CR1_CEN) { }
 
     chEvtWaitAnyTimeout(ALL_EVENTS, TIME_INFINITE);
   }
@@ -188,7 +185,7 @@ static __attribute__((noreturn)) THD_FUNCTION(Ws2812b, arg) {
 
 #define MAX_BRIGHTNESS                    15
 
-// http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.43.3639
+// http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.43.3639 (modified)
 /* Generates numbers between 0 and 1. */
 static float lfsr113(void) {
     static uint32_t z1 = 127, z2 = 127, z3 = 127, z4 = 127;
